@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/netip"
 	"strings"
 	"testing"
 )
@@ -83,7 +84,7 @@ func TestResolveUDPEndpointIPPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != "192.0.2.1:51820" {
+	if got != (netip.MustParseAddrPort("192.0.2.1:51820")) {
 		t.Errorf("got %q", got)
 	}
 }

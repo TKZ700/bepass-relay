@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"sync"
 
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
@@ -28,6 +27,16 @@ type wireGuardOutbound struct {
 }
 
 func newWireGuardOutbound(l *slog.Logger, cfg *wgConfig) (*wireGuardOutbound, error) {
+	endpoint, err := resolveUDPEndpoint(cfg.Peer.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	ipc, err := buildIPCConfig(cfg, endpoint.String())
+	if err != nil {
+		return nil, err
+	}
+
 	localAddrs := make([]netip.Addr, 0, len(cfg.Addresses))
 	for _, p := range cfg.Addresses {
 		localAddrs = append(localAddrs, p.Addr())
@@ -52,19 +61,7 @@ func newWireGuardOutbound(l *slog.Logger, cfg *wgConfig) (*wireGuardOutbound, er
 		},
 	}
 
-	dev := device.NewDevice(tunDev, conn.NewStdNetBind(), logger)
-
-	endpoint, err := resolveUDPEndpoint(cfg.Peer.Endpoint)
-	if err != nil {
-		dev.Close()
-		return nil, err
-	}
-
-	ipc, err := buildIPCConfig(cfg, endpoint)
-	if err != nil {
-		dev.Close()
-		return nil, err
-	}
+	dev := device.NewDevice(tunDev, newWGClientBind(endpoint), logger)
 
 	if err := dev.IpcSet(ipc); err != nil {
 		dev.Close()
@@ -84,6 +81,12 @@ func newWireGuardOutbound(l *slog.Logger, cfg *wgConfig) (*wireGuardOutbound, er
 // DialContext connects to address through the WireGuard tunnel. Hostnames are
 // resolved through the tunnel's DNS servers so lookups never leak locally.
 func (o *wireGuardOutbound) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	switch network {
+	case "tcp", "udp":
+	default:
+		return nil, fmt.Errorf("unsupported network %q for wireguard outbound", network)
+	}
+
 	if err := o.ensureUp(); err != nil {
 		return nil, err
 	}
@@ -93,14 +96,10 @@ func (o *wireGuardOutbound) DialContext(ctx context.Context, network, address st
 		return nil, err
 	}
 
-	switch network {
-	case "tcp":
+	if network == "tcp" {
 		return o.tnet.DialContextTCPAddrPort(ctx, raddr)
-	case "udp":
-		return o.tnet.DialUDPAddrPort(netip.AddrPort{}, raddr)
-	default:
-		return nil, fmt.Errorf("unsupported network %q for wireguard outbound", network)
 	}
+	return o.tnet.DialUDPAddrPort(netip.AddrPort{}, raddr)
 }
 
 // Close shuts down the tunnel device. Safe to call multiple times.
@@ -182,31 +181,44 @@ func pickFamilyMatch(local []netip.Addr, candidates []string) (netip.Addr, bool)
 
 // resolveUDPEndpoint resolves the peer endpoint hostname using the host
 // resolver at startup, since the bind layer only accepts ip:port endpoints.
-func resolveUDPEndpoint(endpoint string) (string, error) {
+// IPv4 results are preferred so the client bind opens a single v4 socket even
+// on hosts with broken or disabled IPv6.
+func resolveUDPEndpoint(endpoint string) (netip.AddrPort, error) {
 	host, port, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		return "", fmt.Errorf("invalid wireguard endpoint %q: %w", endpoint, err)
+		return netip.AddrPort{}, fmt.Errorf("invalid wireguard endpoint %q: %w", endpoint, err)
 	}
 
 	pnum, err := strconv.ParseUint(port, 10, 16)
 	if err != nil || pnum == 0 {
-		return "", fmt.Errorf("invalid wireguard endpoint port %q", port)
+		return netip.AddrPort{}, fmt.Errorf("invalid wireguard endpoint port %q", port)
 	}
 
 	addr, err := netip.ParseAddr(host)
 	if err != nil {
 		addrs, err := net.DefaultResolver.LookupHost(context.Background(), host)
 		if err != nil {
-			return "", fmt.Errorf("resolve wireguard endpoint %q: %w", host, err)
+			return netip.AddrPort{}, fmt.Errorf("resolve wireguard endpoint %q: %w", host, err)
 		}
-		if len(addrs) == 0 {
-			return "", fmt.Errorf("no addresses found for wireguard endpoint %q", host)
-		}
-		addr, err = netip.ParseAddr(addrs[0])
+		addr, err = pickPreferredAddr(addrs)
 		if err != nil {
-			return "", fmt.Errorf("invalid resolved endpoint address %q", addrs[0])
+			return netip.AddrPort{}, fmt.Errorf("resolve wireguard endpoint %q: %w", host, err)
 		}
 	}
 
-	return netip.AddrPortFrom(addr.Unmap(), uint16(pnum)).String(), nil
+	return netip.AddrPortFrom(addr.Unmap(), uint16(pnum)), nil
+}
+
+func pickPreferredAddr(addrs []string) (netip.Addr, error) {
+	for _, s := range addrs {
+		if a, err := netip.ParseAddr(s); err == nil && a.Is4() {
+			return a, nil
+		}
+	}
+	for _, s := range addrs {
+		if a, err := netip.ParseAddr(s); err == nil {
+			return a, nil
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("no usable addresses")
 }

@@ -158,7 +158,9 @@ Behavior notes:
 - When `-w` is set, **every** TCP and UDP outbound connection is attempted through the tunnel.
 - If the tunnel fails to dial, the relay silently falls back to a direct dial for that connection (visible in debug logs).
 - Hostnames are resolved through the tunnel's DNS servers, so DNS queries never leak to the local resolver.
-- The endpoint hostname is resolved once at startup using the host resolver.
+- The endpoint hostname is resolved once at startup using the host resolver (IPv4 preferred).
+- The relay acts as a WireGuard **client only**: it opens a single outbound UDP socket whose address family matches the server endpoint - it never listens on an inbound v4+v6 socket pair like the official tooling does.
+- Set `ListenPort` inside `[Interface]` to pin the local UDP source port of the tunnel socket; omit it to use an ephemeral port.
 - An invalid or unreadable config file is a fatal startup error.
 
 ## License
