@@ -163,6 +163,25 @@ Behavior notes:
 - Set `ListenPort` inside `[Interface]` to pin the local UDP source port of the tunnel socket; omit it to use an ephemeral port.
 - An invalid or unreadable config file is a fatal startup error.
 
+### Troubleshooting the WireGuard chain
+
+If sites fail to load while chained through WireGuard:
+
+1. **Check that the handshake completes** - run the relay with `-v` and look for a
+   `Received handshake response` line from the wireguard logger. If you only see
+   `Sending handshake initiation`, your outbound UDP to the server is blocked
+   (firewall or ISP-level WireGuard blocking). Test with another port/protocol
+   or a different endpoint.
+2. **Verify the server-side peer config** - the WG server's `[Peer]` entry for
+   the relay must contain `AllowedIPs = <relay tunnel IP>/32` matching the relay's
+   `Address`. If it doesn't, the handshake succeeds but return traffic is dropped:
+   connections open yet nothing loads.
+3. **Lower the MTU if pages stall mid-load** - set `MTU = 1280` in
+   `[Interface]`; overly optimistic MTU lets TCP connect but breaks TLS/pages.
+4. **Dial timeouts** - tunnel dials are bounded (`10s` for TCP, `5s` for DNS);
+   when the tunnel is dead, affected connections automatically fall back to
+   direct dialing instead of hanging forever.
+
 ## License
 
 MIT Public License

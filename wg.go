@@ -10,12 +10,17 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"time"
 
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
-const wgDefaultDNS = "1.1.1.1"
+const (
+	wgDefaultDNS   = "1.1.1.1"
+	wgDialTimeout  = 10 * time.Second
+	wgDNSTimeout   = 5 * time.Second
+)
 
 type wireGuardOutbound struct {
 	l          *slog.Logger
@@ -97,7 +102,13 @@ func (o *wireGuardOutbound) DialContext(ctx context.Context, network, address st
 	}
 
 	if network == "tcp" {
-		return o.tnet.DialContextTCPAddrPort(ctx, raddr)
+		dialCtx, cancel := context.WithTimeout(ctx, wgDialTimeout)
+		defer cancel()
+		conn, err := o.tnet.DialContextTCPAddrPort(dialCtx, raddr)
+		if err != nil {
+			return nil, fmt.Errorf("tunnel dial %s: %w", raddr, err)
+		}
+		return conn, nil
 	}
 	return o.tnet.DialUDPAddrPort(netip.AddrPort{}, raddr)
 }
@@ -136,7 +147,9 @@ func (o *wireGuardOutbound) resolveAddrPort(ctx context.Context, address string)
 	}
 
 	// Not an IP literal; resolve through the tunnel's DNS servers.
-	addrs, err := o.tnet.LookupContextHost(ctx, host)
+	dnsCtx, cancel := context.WithTimeout(ctx, wgDNSTimeout)
+	defer cancel()
+	addrs, err := o.tnet.LookupContextHost(dnsCtx, host)
 	if err != nil {
 		return netip.AddrPort{}, fmt.Errorf("resolve %q through tunnel: %w", host, err)
 	}
