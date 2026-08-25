@@ -2,3 +2,6 @@ build/
 .idea
 nohup.out
 bepass-relay
+wireguard.conf
+*.conf
+

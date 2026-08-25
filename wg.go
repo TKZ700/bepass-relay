@@ -1,0 +1,212 @@
+// wg.go implements an outbound that tunnels every connection through a
+// WireGuard server using the userspace wireguard-go stack (no TUN device).
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/netip"
+	"strconv"
+	"sync"
+
+	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/tun/netstack"
+)
+
+const wgDefaultDNS = "1.1.1.1"
+
+type wireGuardOutbound struct {
+	l          *slog.Logger
+	dev        *device.Device
+	tnet       *netstack.Net
+	localAddrs []netip.Addr
+	upOnce     sync.Once
+	upErr      error
+}
+
+func newWireGuardOutbound(l *slog.Logger, cfg *wgConfig) (*wireGuardOutbound, error) {
+	localAddrs := make([]netip.Addr, 0, len(cfg.Addresses))
+	for _, p := range cfg.Addresses {
+		localAddrs = append(localAddrs, p.Addr())
+	}
+
+	dnsServers := cfg.DNS
+	if len(dnsServers) == 0 {
+		dnsServers = []netip.Addr{netip.MustParseAddr(wgDefaultDNS)}
+	}
+
+	tunDev, tnet, err := netstack.CreateNetTUN(localAddrs, dnsServers, cfg.MTU)
+	if err != nil {
+		return nil, fmt.Errorf("create wireguard network stack: %w", err)
+	}
+
+	logger := &device.Logger{
+		Verbosef: func(format string, args ...any) {
+			l.Debug("wireguard: " + fmt.Sprintf(format, args...))
+		},
+		Errorf: func(format string, args ...any) {
+			l.Error("wireguard: " + fmt.Sprintf(format, args...))
+		},
+	}
+
+	dev := device.NewDevice(tunDev, conn.NewStdNetBind(), logger)
+
+	endpoint, err := resolveUDPEndpoint(cfg.Peer.Endpoint)
+	if err != nil {
+		dev.Close()
+		return nil, err
+	}
+
+	ipc, err := buildIPCConfig(cfg, endpoint)
+	if err != nil {
+		dev.Close()
+		return nil, err
+	}
+
+	if err := dev.IpcSet(ipc); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("apply wireguard config: %w", err)
+	}
+
+	o := &wireGuardOutbound{l: l, dev: dev, tnet: tnet, localAddrs: localAddrs}
+	l.Info("wireguard outbound configured",
+		"endpoint", endpoint,
+		"local_addresses", fmt.Sprint(localAddrs),
+		"dns", fmt.Sprint(dnsServers),
+		"mtu", cfg.MTU,
+	)
+	return o, nil
+}
+
+// DialContext connects to address through the WireGuard tunnel. Hostnames are
+// resolved through the tunnel's DNS servers so lookups never leak locally.
+func (o *wireGuardOutbound) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if err := o.ensureUp(); err != nil {
+		return nil, err
+	}
+
+	raddr, err := o.resolveAddrPort(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+
+	switch network {
+	case "tcp":
+		return o.tnet.DialContextTCPAddrPort(ctx, raddr)
+	case "udp":
+		return o.tnet.DialUDPAddrPort(netip.AddrPort{}, raddr)
+	default:
+		return nil, fmt.Errorf("unsupported network %q for wireguard outbound", network)
+	}
+}
+
+// Close shuts down the tunnel device. Safe to call multiple times.
+func (o *wireGuardOutbound) Close() error {
+	o.dev.Close()
+	return nil
+}
+
+// ensureUp brings the device up on first use. A failed attempt is cached;
+// subsequent dials fall straight through to the failover path.
+func (o *wireGuardOutbound) ensureUp() error {
+	o.upOnce.Do(func() {
+		if err := o.dev.Up(); err != nil {
+			o.upErr = fmt.Errorf("bring up wireguard device: %w", err)
+		}
+	})
+	return o.upErr
+}
+
+func (o *wireGuardOutbound) resolveAddrPort(ctx context.Context, address string) (netip.AddrPort, error) {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("invalid destination %q: %w", address, err)
+	}
+
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("invalid destination port %q", portStr)
+	}
+
+	addr, err := netip.ParseAddr(host)
+	if err == nil {
+		return netip.AddrPortFrom(addr.Unmap(), uint16(port)), nil
+	}
+
+	// Not an IP literal; resolve through the tunnel's DNS servers.
+	addrs, err := o.tnet.LookupContextHost(ctx, host)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("resolve %q through tunnel: %w", host, err)
+	}
+
+	chosen, ok := pickFamilyMatch(o.localAddrs, addrs)
+	if !ok {
+		return netip.AddrPort{}, fmt.Errorf("no usable addresses for %q", host)
+	}
+	return netip.AddrPortFrom(chosen.Unmap(), uint16(port)), nil
+}
+
+// pickFamilyMatch prefers candidates whose IP family matches one of the
+// tunnel's local addresses, falling back to the first candidate.
+func pickFamilyMatch(local []netip.Addr, candidates []string) (netip.Addr, bool) {
+	hasV4, hasV6 := false, false
+	for _, a := range local {
+		if a.Is4() {
+			hasV4 = true
+		} else {
+			hasV6 = true
+		}
+	}
+
+	for _, c := range candidates {
+		a, err := netip.ParseAddr(c)
+		if err != nil {
+			continue
+		}
+		if (a.Is4() && hasV4) || (!a.Is4() && hasV6) {
+			return a, true
+		}
+	}
+
+	if len(candidates) > 0 {
+		a, err := netip.ParseAddr(candidates[0])
+		if err == nil {
+			return a, true
+		}
+	}
+	return netip.Addr{}, false
+}
+
+// resolveUDPEndpoint resolves the peer endpoint hostname using the host
+// resolver at startup, since the bind layer only accepts ip:port endpoints.
+func resolveUDPEndpoint(endpoint string) (string, error) {
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid wireguard endpoint %q: %w", endpoint, err)
+	}
+
+	pnum, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || pnum == 0 {
+		return "", fmt.Errorf("invalid wireguard endpoint port %q", port)
+	}
+
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		addrs, err := net.DefaultResolver.LookupHost(context.Background(), host)
+		if err != nil {
+			return "", fmt.Errorf("resolve wireguard endpoint %q: %w", host, err)
+		}
+		if len(addrs) == 0 {
+			return "", fmt.Errorf("no addresses found for wireguard endpoint %q", host)
+		}
+		addr, err = netip.ParseAddr(addrs[0])
+		if err != nil {
+			return "", fmt.Errorf("invalid resolved endpoint address %q", addrs[0])
+		}
+	}
+
+	return netip.AddrPortFrom(addr.Unmap(), uint16(pnum)).String(), nil
+}

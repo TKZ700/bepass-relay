@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -41,7 +42,7 @@ func readFromConn(l *slog.Logger, conn net.Conn, c chan<- []byte) {
 }
 
 // handleUDPOverTCP handles UDP-over-TCP traffic.
-func handleUDPOverTCP(l *slog.Logger, conn net.Conn, destination string) {
+func handleUDPOverTCP(l *slog.Logger, ob outbound, conn net.Conn, destination string) {
 	// On return, delete the destination from the map of active tunnels
 	defer delete(activeTunnels, destination)
 
@@ -59,7 +60,7 @@ func handleUDPOverTCP(l *slog.Logger, conn net.Conn, destination string) {
 				return
 			}
 
-			udpWriteChan, err := getOrCreateUDPChan(l, destination, string(dataFromWS[:8]))
+			udpWriteChan, err := getOrCreateUDPChan(l, ob, destination, string(dataFromWS[:8]))
 			if err != nil {
 				l.Debug("unable to connect to destination", "protocol", "udp", "address", destination, "error", err.Error())
 				continue
@@ -85,13 +86,13 @@ func handleUDPOverTCP(l *slog.Logger, conn net.Conn, destination string) {
 }
 
 // getOrCreateUDPChan returns an existing UDP channel or creates a new one.
-func getOrCreateUDPChan(l *slog.Logger, destination, header string) (chan []byte, error) {
+func getOrCreateUDPChan(l *slog.Logger, ob outbound, destination, header string) (chan []byte, error) {
 	channelID := destination + header
 	if udpWriteChan, ok := udpToTCPChannels[channelID]; ok {
 		return udpWriteChan, nil
 	}
 
-	udpConn, err := net.Dial("udp", destination)
+	udpConn, err := ob.DialContext(context.Background(), "udp", destination)
 	if err != nil {
 		return nil, err
 	}

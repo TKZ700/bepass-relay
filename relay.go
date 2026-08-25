@@ -21,7 +21,35 @@ import (
 
 const BUFFER_SIZE = 2048
 
-func run(ctx context.Context, l *slog.Logger, bind string) error {
+// buildOutbound constructs the outbound chain. Without a WireGuard config the
+// relay dials directly; with one, every connection is attempted through the
+// tunnel and falls back to direct dialing on failure.
+func buildOutbound(l *slog.Logger, wgConfigPath string) (outbound, error) {
+	direct := newDirectOutbound()
+	if wgConfigPath == "" {
+		return direct, nil
+	}
+
+	cfg, err := LoadWGConfig(wgConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("load wireguard config: %w", err)
+	}
+
+	tunnel, err := newWireGuardOutbound(l, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return newFailoverOutbound(l, tunnel, direct), nil
+}
+
+func run(ctx context.Context, l *slog.Logger, bind, wgConfigPath string) error {
+	ob, err := buildOutbound(l, wgConfigPath)
+	if err != nil {
+		return err
+	}
+	defer ob.Close()
+
 	listener, err := net.Listen("tcp", bind)
 	if err != nil {
 		return err
@@ -48,12 +76,12 @@ func run(ctx context.Context, l *slog.Logger, bind string) error {
 				continue
 			}
 
-			go handleConnection(l, conn)
+			go handleConnection(l, ob, conn)
 		}
 	}
 }
 
-func handleConnection(l *slog.Logger, lConn net.Conn) {
+func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 	reader := bufio.NewReader(lConn)
 
 	header, _ := reader.ReadBytes(byte(13))
@@ -106,7 +134,7 @@ func handleConnection(l *slog.Logger, lConn net.Conn) {
 
 	switch network {
 	case "tcp":
-		rConn, err := net.Dial(network, address)
+		rConn, err := ob.DialContext(context.Background(), network, address)
 		if err != nil {
 			l.Error("failed to dial", "protocol", network, "address", address, "error", err.Error())
 			lConn.Close()
@@ -116,7 +144,7 @@ func handleConnection(l *slog.Logger, lConn net.Conn) {
 		go handleTCP(lConn, rConn)
 
 	case "udp":
-		go handleUDPOverTCP(l, lConn, address)
+		go handleUDPOverTCP(l, ob, lConn, address)
 	}
 	l.Debug("relaying connection", "protocol", network, "address", address)
 }
@@ -137,8 +165,9 @@ func Copy(src io.Reader, dst io.Writer) {
 func main() {
 	fs := ff.NewFlagSet("bepass-relay")
 	var (
-		verbose = fs.Bool('v', "verbose", "enable verbose logging")
-		bind    = fs.String('b', "bind", "0.0.0.0:6666", "bind address")
+		verbose    = fs.Bool('v', "verbose", "enable verbose logging")
+		bind       = fs.String('b', "bind", "0.0.0.0:6666", "bind address")
+		wgConfPath = fs.String('w', "wg-config", "", "path to WireGuard config file (enables WireGuard outbound)")
 	)
 
 	err := ff.Parse(fs, os.Args[1:])
@@ -158,7 +187,7 @@ func main() {
 	}
 
 	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	if err := run(ctx, l, *bind); err != nil {
+	if err := run(ctx, l, *bind, *wgConfPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}

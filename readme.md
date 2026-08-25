@@ -112,6 +112,54 @@ It's simple! Just follow these 3 easy steps:
 - [x] Better loopback support
 - [x] Full IPv6 support
 - [x] Full UDP support
+- [x] WireGuard outbound (proxy chain: relay -> WireGuard server -> destination)
+
+# Command Line Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-v`, `--verbose` | off | Enable verbose (debug) logging |
+| `-b`, `--bind` | `0.0.0.0:6666` | Bind address of the relay listener |
+| `-w`, `--wg-config` | empty | Path to a wg-quick style WireGuard config file; when set, all outbound traffic is tunneled |
+
+## WireGuard Outbound
+
+The relay can chain all of its traffic through a WireGuard server:
+
+```
+Client -> Worker -> Relay -> [WireGuard tunnel] -> WG Server -> Destination
+```
+
+This is implemented entirely in userspace inside the relay binary (wireguard-go with an embedded network stack) - no kernel module, no TUN device and no root privileges are required.
+
+To enable it, pass a standard **wg-quick** client configuration file:
+
+```
+./relay -b 0.0.0.0:6666 -w /etc/wireguard/wireguard.conf
+```
+
+Example `wireguard.conf` (same format you would use with the official WireGuard client):
+
+```ini
+[Interface]
+PrivateKey = <relay's private key>
+Address = 10.66.66.2/24
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = <WG server public key>
+Endpoint = vpn.example.com:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+```
+
+Behavior notes:
+
+- When `-w` is set, **every** TCP and UDP outbound connection is attempted through the tunnel.
+- If the tunnel fails to dial, the relay silently falls back to a direct dial for that connection (visible in debug logs).
+- Hostnames are resolved through the tunnel's DNS servers, so DNS queries never leak to the local resolver.
+- The endpoint hostname is resolved once at startup using the host resolver.
+- An invalid or unreadable config file is a fatal startup error.
 
 ## License
 
