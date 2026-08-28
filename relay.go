@@ -34,6 +34,13 @@ func (c *multiConn) Read(p []byte) (int, error) {
 	return c.Reader.Read(p)
 }
 
+func (c *multiConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
 // buildOutbound constructs the outbound chain. Without a WireGuard config the
 // relay dials directly; with one, every connection is attempted through the
 // tunnel and falls back to direct dialing on failure.

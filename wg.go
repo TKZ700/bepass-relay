@@ -85,8 +85,110 @@ func newWireGuardOutbound(l *slog.Logger, cfg *wgConfig) (*wireGuardOutbound, er
 		"mtu", cfg.MTU,
 		"listen_port", cfg.ListenPort,
 	)
-	l.Info("wireguard will be brought up on first dial; run with -v to see handshake logs (look for 'Handshake did not complete' or 'Received handshake response')")
+
+	// Startup self-test: bring the device up and try a ping/dial through the tunnel.
+	// This catches bad AllowedIPs, firewall blocks, or wrong keys immediately
+	// instead of waiting for the first client connection (which would see a 10s timeout).
+	// Run in background so the relay starts listening immediately.
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		l.Info("wireguard: testing connectivity (dialing 1.1.1.1:80 and DNS via tunnel)...")
+		testCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		if err := o.testConnectivity(testCtx); err != nil {
+			l.Warn("wireguard connectivity test FAILED – tunnel likely broken", "error", err.Error())
+			l.Warn("check server AllowedIPs (must include relay's Address), firewall/UDP blocking, and keys; relay will still start and fall back to direct")
+			l.Warn("run with -v for handshake logs (look for 'Handshake did not complete' or 'Received handshake response')")
+		} else {
+			l.Info("wireguard connectivity test PASSED – tunnel is working")
+		}
+	}()
+
+	l.Info("wireguard ready – will be brought up on first dial")
 	return o, nil
+}
+
+// testConnectivity verifies the tunnel can actually carry traffic by dialing
+// a well-known address through it and doing a DNS lookup via the tunnel.
+func (o *wireGuardOutbound) testConnectivity(ctx context.Context) error {
+	if err := o.ensureUp(); err != nil {
+		return fmt.Errorf("device up failed: %w", err)
+	}
+
+	// Give the handshake a moment to start. Dialing itself triggers it, but a
+	// tiny sleep helps avoid racing the very first packet.
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// 1) DNS via tunnel
+	dnsStart := time.Now()
+	dnsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	addrs, err := o.tnet.LookupContextHost(dnsCtx, "one.one.one.one")
+	cancel()
+	if err != nil {
+		return fmt.Errorf("tunnel DNS lookup failed (one.one.one.one): %w", err)
+	}
+	o.l.Debug("wireguard test: DNS via tunnel succeeded", "addrs", fmt.Sprint(addrs), "duration", time.Since(dnsStart).String())
+
+	// 2) TCP dial via tunnel to a well-known IP (avoids needing DNS for the data path)
+	target := netip.MustParseAddrPort("1.1.1.1:80")
+	dialStart := time.Now()
+	dialCtx, cancel2 := context.WithTimeout(ctx, 7*time.Second)
+	conn, err := o.tnet.DialContextTCPAddrPort(dialCtx, target)
+	cancel2()
+	if err != nil {
+		return fmt.Errorf("tunnel TCP dial to %s failed: %w", target, err)
+	}
+	_ = conn.Close()
+	o.l.Debug("wireguard test: TCP dial via tunnel succeeded", "target", target.String(), "duration", time.Since(dialStart).String())
+
+	// 3) Optional ICMP ping via tunnel (best-effort, not fatal if it fails)
+	if err := o.testPing(ctx, netip.MustParseAddr("1.1.1.1")); err != nil {
+		o.l.Debug("wireguard test: ping via tunnel failed (non-fatal)", "error", err.Error())
+	} else {
+		o.l.Debug("wireguard test: ping via tunnel succeeded")
+	}
+
+	return nil
+}
+
+func (o *wireGuardOutbound) testPing(ctx context.Context, target netip.Addr) error {
+	// Use the netstack ping API if available.
+	pingConn, err := o.tnet.DialPingAddr(netip.Addr{}, target)
+	if err != nil {
+		return err
+	}
+	defer pingConn.Close()
+
+	// Send a minimal payload and wait for echo. Use deadline from ctx.
+	deadline, ok := ctx.Deadline()
+	if ok {
+		_ = pingConn.SetDeadline(deadline)
+	} else {
+		_ = pingConn.SetDeadline(time.Now().Add(3 * time.Second))
+	}
+
+	payload := []byte("bepss-ping")
+	if _, err := pingConn.WriteTo(payload, &net.IPAddr{IP: net.IP(target.AsSlice())}); err != nil {
+		// DialPing uses a custom PingConn; Write may not be WriteTo – try Write
+		if _, err2 := pingConn.Write(payload); err2 != nil {
+			return err2
+		}
+	}
+
+	buf := make([]byte, 1500)
+	_ = pingConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, err := pingConn.ReadFrom(buf)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("empty ping reply")
+	}
+	return nil
 }
 
 // DialContext connects to address through the WireGuard tunnel. Hostnames are

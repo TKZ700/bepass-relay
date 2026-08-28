@@ -39,22 +39,22 @@ func handleTCPWithLogger(l *slog.Logger, lConn, rConn net.Conn, remote, address 
 
 	go func() {
 		defer wg.Done()
-		n, _ := CopyWithBytes(rConn, lConn)
-		bytesBtoA = n
-		if l != nil {
-			l.Debug("TCP direction finished", "direction", "remote->client", "remote", remote, "address", address, "bytes", n, "duration", time.Since(start).String())
-		}
-		closeWrite(lConn)
-	}()
-
-	go func() {
-		defer wg.Done()
-		n, _ := CopyWithBytes(lConn, rConn)
+		n, _ := CopyWithBytes(rConn, lConn) // client -> remote
 		bytesAtoB = n
 		if l != nil {
 			l.Debug("TCP direction finished", "direction", "client->remote", "remote", remote, "address", address, "bytes", n, "duration", time.Since(start).String())
 		}
 		closeWrite(rConn)
+	}()
+
+	go func() {
+		defer wg.Done()
+		n, _ := CopyWithBytes(lConn, rConn) // remote -> client
+		bytesBtoA = n
+		if l != nil {
+			l.Debug("TCP direction finished", "direction", "remote->client", "remote", remote, "address", address, "bytes", n, "duration", time.Since(start).String())
+		}
+		closeWrite(lConn)
 	}()
 
 	wg.Wait()
