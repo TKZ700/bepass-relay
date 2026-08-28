@@ -18,8 +18,8 @@ import (
 
 const (
 	wgDefaultDNS   = "1.1.1.1"
-	wgDialTimeout  = 10 * time.Second
-	wgDNSTimeout   = 5 * time.Second
+	wgDialTimeout  = 5 * time.Second
+	wgDNSTimeout   = 3 * time.Second
 )
 
 type wireGuardOutbound struct {

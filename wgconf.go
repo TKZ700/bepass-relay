@@ -14,7 +14,7 @@ import (
 	"strings"
 )
 
-const wgDefaultMTU = 1420
+const wgDefaultMTU = 1280
 
 // wgPeerConfig holds the parsed [Peer] section of a WireGuard config file.
 type wgPeerConfig struct {
@@ -272,6 +272,11 @@ func buildIPCConfig(c *wgConfig, endpoint string) (string, error) {
 		return "", err
 	}
 
+	keepalive := c.Peer.PersistentKeepalive
+	if keepalive == 0 {
+		keepalive = 25
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "private_key=%s\n", privHex)
 	if c.ListenPort > 0 {
@@ -288,8 +293,6 @@ func buildIPCConfig(c *wgConfig, endpoint string) (string, error) {
 	fmt.Fprintf(&b, "endpoint=%s\n", endpoint)
 	fmt.Fprintf(&b, "allowed_ip=0.0.0.0/0\n")
 	fmt.Fprintf(&b, "allowed_ip=::/0\n")
-	if c.Peer.PersistentKeepalive > 0 {
-		fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", c.Peer.PersistentKeepalive)
-	}
+	fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", keepalive)
 	return b.String(), nil
 }

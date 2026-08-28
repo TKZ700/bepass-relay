@@ -74,8 +74,8 @@ func TestBuildIPCConfigMinimal(t *testing.T) {
 	if strings.Contains(ipc, "preshared_key") {
 		t.Error("preshared_key should be omitted when unset")
 	}
-	if strings.Contains(ipc, "persistent_keepalive") {
-		t.Error("persistent_keepalive should be omitted when zero")
+	if !strings.Contains(ipc, "persistent_keepalive_interval=25") {
+		t.Error("persistent_keepalive should default to 25, got:", ipc)
 	}
 }
 
