@@ -144,10 +144,10 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 		return
 	}
 
-	// Combine any data already buffered by the bufio.Reader with the raw
-	// connection so that no client bytes are lost after the header.
-	combinedReader := io.MultiReader(reader, lConn)
-	mc := &multiConn{Reader: combinedReader, Conn: lConn}
+	// Preserve any bytes already buffered by the bufio.Reader. Using the
+	// reader itself for subsequent reads guarantees no data after the header
+	// is lost, even when the header and payload arrived in one segment.
+	mc := &multiConn{Reader: reader, Conn: lConn}
 
 	switch network {
 	case "tcp":
@@ -166,18 +166,7 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 	l.Debug("relaying connection", "protocol", network, "address", address)
 }
 
-// Copy reads from src and writes to dst until either EOF is reached on src or
-// an error occurs. It returns the number of bytes copied and any error
-// encountered. Copy uses a fixed-size buffer to efficiently copy data between
-// the source and destination.
-func Copy(src io.Reader, dst io.Writer) {
-	buf := make([]byte, BUFFER_SIZE)
 
-	_, err := io.CopyBuffer(dst, src, buf[:cap(buf)])
-	if err != nil {
-		fmt.Println(err)
-	}
-}
 
 func main() {
 	fs := ff.NewFlagSet("bepass-relay")
