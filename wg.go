@@ -109,14 +109,15 @@ func newWireGuardOutbound(l *slog.Logger, cfg *wgConfig) (*wireGuardOutbound, er
 }
 
 // testConnectivity verifies the tunnel can actually carry traffic by dialing
-// a well-known address through it and doing a DNS lookup via the tunnel.
+// well-known addresses through it and doing a DNS lookup via the tunnel.
+// It tests both a generic IP (1.1.1.1) and a Cloudflare-fronted IP similar to
+// the ones the relay will actually proxy (e.g. 104.26.12.23), since some
+// servers treat them differently.
 func (o *wireGuardOutbound) testConnectivity(ctx context.Context) error {
 	if err := o.ensureUp(); err != nil {
 		return fmt.Errorf("device up failed: %w", err)
 	}
 
-	// Give the handshake a moment to start. Dialing itself triggers it, but a
-	// tiny sleep helps avoid racing the very first packet.
 	select {
 	case <-time.After(500 * time.Millisecond):
 	case <-ctx.Done():
@@ -133,17 +134,20 @@ func (o *wireGuardOutbound) testConnectivity(ctx context.Context) error {
 	}
 	o.l.Debug("wireguard test: DNS via tunnel succeeded", "addrs", fmt.Sprint(addrs), "duration", time.Since(dnsStart).String())
 
-	// 2) TCP dial via tunnel to a well-known IP (avoids needing DNS for the data path)
-	target := netip.MustParseAddrPort("1.1.1.1:80")
-	dialStart := time.Now()
-	dialCtx, cancel2 := context.WithTimeout(ctx, 7*time.Second)
-	conn, err := o.tnet.DialContextTCPAddrPort(dialCtx, target)
-	cancel2()
-	if err != nil {
-		return fmt.Errorf("tunnel TCP dial to %s failed: %w", target, err)
+	// 2) TCP dials via tunnel – test both a generic and a CF-fronted target.
+	// The CF target is important because the relay's main job is CF loopback.
+	for _, targetStr := range []string{"1.1.1.1:80", "104.16.132.229:443"} {
+		target := netip.MustParseAddrPort(targetStr)
+		dialStart := time.Now()
+		dialCtx, cancel2 := context.WithTimeout(ctx, 6*time.Second)
+		conn, err := o.tnet.DialContextTCPAddrPort(dialCtx, target)
+		cancel2()
+		if err != nil {
+			return fmt.Errorf("tunnel TCP dial to %s failed: %w", target, err)
+		}
+		_ = conn.Close()
+		o.l.Debug("wireguard test: TCP dial via tunnel succeeded", "target", target.String(), "duration", time.Since(dialStart).String())
 	}
-	_ = conn.Close()
-	o.l.Debug("wireguard test: TCP dial via tunnel succeeded", "target", target.String(), "duration", time.Since(dialStart).String())
 
 	// 3) Optional ICMP ping via tunnel (best-effort, not fatal if it fails)
 	if err := o.testPing(ctx, netip.MustParseAddr("1.1.1.1")); err != nil {
