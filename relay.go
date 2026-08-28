@@ -34,6 +34,37 @@ func (c *multiConn) Read(p []byte) (int, error) {
 	return c.Reader.Read(p)
 }
 
+// readHeader reads a line terminated by \r, \n, or \r\n and returns the line
+// without the delimiter. It is compatible with both the legacy relay protocol
+// (\r) and the current bepass-worker (\r\n from `${mmd}\r\n`).
+func readHeader(r *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			if len(buf) == 0 {
+				return "", err
+			}
+			return strings.TrimSpace(string(buf)), nil
+		}
+		if b == '\r' {
+			// Consume optional \n after \r
+			if peek, _ := r.Peek(1); len(peek) == 1 && peek[0] == '\n' {
+				_, _ = r.ReadByte()
+			}
+			return string(buf), nil
+		}
+		if b == '\n' {
+			return string(buf), nil
+		}
+		buf = append(buf, b)
+		// Guard against absurdly long header (DoS)
+		if len(buf) > 2048 {
+			return "", fmt.Errorf("header too long")
+		}
+	}
+}
+
 func (c *multiConn) CloseWrite() error {
 	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
@@ -116,25 +147,26 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 	reader := bufio.NewReader(lConn)
 
 	// Guard header read with a deadline so a stuck client can't hold the
-	// goroutine forever.
+	// goroutine forever. Worker sends header as `${net}@${host}$${port}\r\n`
+	// (see bepass-worker src/worker.ts). Handle \r, \n, and \r\n.
 	_ = lConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	header, err := reader.ReadBytes(byte(13))
+	headerStr, err := readHeader(reader)
 	_ = lConn.SetReadDeadline(time.Time{})
 	if err != nil {
 		l.Warn("failed to read header", "remote", remote, "error", err.Error(), "duration", time.Since(start).String())
 		lConn.Close()
 		return
 	}
-	if len(header) < 1 {
+	if headerStr == "" {
 		l.Warn("empty header", "remote", remote, "duration", time.Since(start).String())
 		lConn.Close()
 		return
 	}
-	l.Debug("header received", "remote", remote, "raw", fmt.Sprintf("%q", string(header)), "duration", time.Since(start).String())
+	l.Debug("header received", "remote", remote, "raw", fmt.Sprintf("%q", headerStr), "duration", time.Since(start).String())
 
-	inputHeader := strings.Split(string(header[:len(header)-1]), "@")
+	inputHeader := strings.Split(headerStr, "@")
 	if len(inputHeader) < 2 {
-		l.Warn("invalid header format", "remote", remote, "header", fmt.Sprintf("%q", string(header)))
+		l.Warn("invalid header format", "remote", remote, "header", fmt.Sprintf("%q", headerStr))
 		lConn.Close()
 		return
 	}
