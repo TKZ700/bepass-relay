@@ -149,15 +149,28 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 	blockFlag := false
 	addr, err := netip.ParseAddr(dh)
 	if err != nil {
-		// the host may not be an IP, try to resolve it
-		l.Debug("resolving destination host", "remote", remote, "host", dh)
-		ips, err := net.LookupIP(dh)
-		if err != nil {
-			l.Warn("failed to resolve destination", "remote", remote, "host", dh, "error", err.Error(), "duration", time.Since(start).String())
-			lConn.Close()
-			return
+		// the host may not be an IP, try to resolve it (with DNS cache)
+		var ips []net.IP
+		if hostDNSCache != nil {
+			if cached, ok := hostDNSCache.GetIPs(dh); ok {
+				l.Debug("DNS cache hit (host)", "remote", remote, "host", dh, "ips", fmt.Sprint(cached))
+				ips = cached
+			}
 		}
-		l.Debug("destination resolved", "remote", remote, "host", dh, "ip", ips[0].String())
+		if ips == nil {
+			l.Debug("resolving destination host", "remote", remote, "host", dh)
+			lookupStart := time.Now()
+			ips, err = net.LookupIP(dh)
+			if err != nil {
+				l.Warn("failed to resolve destination", "remote", remote, "host", dh, "error", err.Error(), "duration", time.Since(start).String())
+				lConn.Close()
+				return
+			}
+			l.Debug("destination resolved", "remote", remote, "host", dh, "ip", ips[0].String(), "duration", time.Since(lookupStart).String())
+			if hostDNSCache != nil {
+				hostDNSCache.SetIPs(dh, ips)
+			}
+		}
 
 		// parse the first IP and use it
 		addr, _ = netip.AddrFromSlice(ips[0])
@@ -204,9 +217,11 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 func main() {
 	fs := ff.NewFlagSet("bepass-relay")
 	var (
-		verbose    = fs.Bool('v', "verbose", "enable verbose logging")
-		bind       = fs.String('b', "bind", "0.0.0.0:6666", "bind address")
-		wgConfPath = fs.String('w', "wg-config", "", "path to WireGuard config file (enables WireGuard outbound)")
+		verbose      = fs.Bool('v', "verbose", "enable verbose logging")
+		bind         = fs.String('b', "bind", "0.0.0.0:6666", "bind address")
+		wgConfPath   = fs.String('w', "wg-config", "", "path to WireGuard config file (enables WireGuard outbound)")
+		dnsCacheTTL  = fs.Duration(0, "dns-cache-ttl", 60*time.Second, "DNS cache TTL (0 to disable)")
+		dnsCacheSize = fs.Int(0, "dns-cache-size", 512, "DNS cache max entries")
 	)
 
 	err := ff.Parse(fs, os.Args[1:])
@@ -223,6 +238,14 @@ func main() {
 
 	if *verbose {
 		l = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
+
+	if *dnsCacheTTL > 0 && *dnsCacheSize > 0 {
+		hostDNSCache = NewDNSCache(*dnsCacheTTL, *dnsCacheSize)
+		tunnelDNSCache = NewDNSCache(*dnsCacheTTL, *dnsCacheSize)
+		l.Info("DNS cache enabled", "ttl", dnsCacheTTL.String(), "size", *dnsCacheSize)
+	} else {
+		l.Info("DNS cache disabled")
 	}
 
 	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

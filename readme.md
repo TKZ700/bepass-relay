@@ -121,6 +121,8 @@ It's simple! Just follow these 3 easy steps:
 | `-v`, `--verbose` | off | Enable verbose (debug) logging |
 | `-b`, `--bind` | `0.0.0.0:6666` | Bind address of the relay listener |
 | `-w`, `--wg-config` | empty | Path to a wg-quick style WireGuard config file; when set, all outbound traffic is tunneled |
+| `--dns-cache-ttl` | `60s` | DNS cache TTL (0 to disable) |
+| `--dns-cache-size` | `512` | DNS cache max entries |
 
 ## WireGuard Outbound
 
@@ -156,12 +158,21 @@ PersistentKeepalive = 25
 Behavior notes:
 
 - When `-w` is set, **every** TCP and UDP outbound connection is attempted through the tunnel.
-- If the tunnel fails to dial, the relay silently falls back to a direct dial for that connection (visible in debug logs).
+- If the tunnel fails to dial, the relay falls back to a direct dial for that connection (logged at `WARN` level even without `-v`; succeeds in ~10s + direct dial time).
 - Hostnames are resolved through the tunnel's DNS servers, so DNS queries never leak to the local resolver.
 - The endpoint hostname is resolved once at startup using the host resolver (IPv4 preferred).
 - The relay acts as a WireGuard **client only**: it opens a single outbound UDP socket whose address family matches the server endpoint - it never listens on an inbound v4+v6 socket pair like the official tooling does.
 - Set `ListenPort` inside `[Interface]` to pin the local UDP source port of the tunnel socket; omit it to use an ephemeral port.
 - An invalid or unreadable config file is a fatal startup error.
+
+## DNS Cache
+
+Both the host resolver (for `net.LookupIP`) and the tunnel resolver (for `LookupContextHost` through WireGuard) are cached in-memory:
+
+- TTL and size are controlled by `--dns-cache-ttl` / `--dns-cache-size` (default `60s` / `512` entries, enabled by default).
+- Set `--dns-cache-ttl=0` to disable the cache.
+- Cache hits are logged at `DEBUG` level (`DNS cache hit (host)` / `DNS cache hit (tunnel)`); run with `-v` to see them.
+- This dramatically reduces repeated lookups for proxied websites (especially via the tunnel, where each lookup otherwise costs a round-trip through WireGuard).
 
 ### Troubleshooting the WireGuard chain
 

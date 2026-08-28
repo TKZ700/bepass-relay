@@ -205,17 +205,29 @@ func (o *wireGuardOutbound) resolveAddrPort(ctx context.Context, address string)
 		return netip.AddrPortFrom(addr.Unmap(), uint16(port)), nil
 	}
 
-	// Not an IP literal; resolve through the tunnel's DNS servers.
-	o.l.Debug("wireguard DNS lookup via tunnel", "host", host)
-	dnsCtx, cancel := context.WithTimeout(ctx, wgDNSTimeout)
-	defer cancel()
-	start := time.Now()
-	addrs, err := o.tnet.LookupContextHost(dnsCtx, host)
-	if err != nil {
-		o.l.Warn("wireguard DNS lookup failed", "host", host, "error", err.Error(), "duration", time.Since(start).String())
-		return netip.AddrPort{}, fmt.Errorf("resolve %q through tunnel: %w", host, err)
+	// Not an IP literal; resolve through the tunnel's DNS servers (with cache).
+	var addrs []string
+	if tunnelDNSCache != nil {
+		if cached, ok := tunnelDNSCache.Get(host); ok {
+			o.l.Debug("DNS cache hit (tunnel)", "host", host, "addrs", fmt.Sprint(cached))
+			addrs = cached
+		}
 	}
-	o.l.Debug("wireguard DNS lookup succeeded", "host", host, "addrs", fmt.Sprint(addrs), "duration", time.Since(start).String())
+	if addrs == nil {
+		o.l.Debug("wireguard DNS lookup via tunnel", "host", host)
+		dnsCtx, cancel := context.WithTimeout(ctx, wgDNSTimeout)
+		defer cancel()
+		start := time.Now()
+		addrs, err = o.tnet.LookupContextHost(dnsCtx, host)
+		if err != nil {
+			o.l.Warn("wireguard DNS lookup failed", "host", host, "error", err.Error(), "duration", time.Since(start).String())
+			return netip.AddrPort{}, fmt.Errorf("resolve %q through tunnel: %w", host, err)
+		}
+		o.l.Debug("wireguard DNS lookup succeeded", "host", host, "addrs", fmt.Sprint(addrs), "duration", time.Since(start).String())
+		if tunnelDNSCache != nil {
+			tunnelDNSCache.Set(host, addrs)
+		}
+	}
 
 	chosen, ok := pickFamilyMatch(o.localAddrs, addrs)
 	if !ok {
