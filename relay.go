@@ -72,6 +72,14 @@ func (c *multiConn) CloseWrite() error {
 	return c.Conn.Close()
 }
 
+// isWgEnabled reports whether the outbound is using WireGuard.
+// Used to avoid host DNS leaks: when WG is enabled, hostname resolution for
+// block checks must not use net.LookupIP (host resolver).
+func isWgEnabled(ob outbound) bool {
+	_, ok := ob.(*failoverOutbound)
+	return ok
+}
+
 // buildOutbound constructs the outbound chain. Without a WireGuard config the
 // relay dials directly; with one, every connection is attempted through the
 // tunnel and falls back to direct dialing on failure.
@@ -114,28 +122,42 @@ func run(ctx context.Context, l *slog.Logger, bind, wgConfigPath string) error {
 	defer listener.Close()
 	l.Info("relay listening", "bind", bind)
 
+	// Close the listener when context is cancelled so Accept unblocks.
+	go func() {
+		<-ctx.Done()
+		l.Info("shutting down listener", "bind", bind)
+		_ = listener.Close()
+	}()
+
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-			conn, err := listener.Accept()
-			if err != nil {
-				l.Error("failed to accept connection", "error", err.Error())
-				continue
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				l.Info("relay stopped")
+				return nil
+			default:
 			}
-
-			src := netip.MustParseAddrPort(conn.RemoteAddr().String())
-
-			// Check if srcIP is in the whitelist
-			if !connFilter.isSourceAllowed(src.Addr()) {
-				l.Debug("blocked connection", "address", src)
-				conn.Close()
-				continue
-			}
-
-			go handleConnection(l, ob, conn)
+			// Temporary errors (e.g. EMFILE) should not kill the loop.
+			l.Error("failed to accept connection", "error", err.Error())
+			continue
 		}
+
+		src, err := netip.ParseAddrPort(conn.RemoteAddr().String())
+		if err != nil {
+			l.Debug("failed to parse remote address", "error", err.Error())
+			conn.Close()
+			continue
+		}
+
+		// Check if srcIP is in the whitelist
+		if !connFilter.isSourceAllowed(src.Addr()) {
+			l.Debug("blocked connection", "address", src)
+			conn.Close()
+			continue
+		}
+
+		go handleConnection(l, ob, conn)
 	}
 }
 
@@ -185,43 +207,65 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 	}
 
 	// check if ip is not blocked
+	// IP leak fix: when WireGuard is enabled, do NOT resolve hostnames via the
+	// host's local DNS (which would leak the destination to the local network).
+	// Instead, skip the block check for hostnames and let the tunnel handle DNS.
+	isWg := isWgEnabled(ob)
 	blockFlag := false
 	addr, err := netip.ParseAddr(dh)
 	if err != nil {
-		// the host may not be an IP, try to resolve it (with DNS cache)
-		var ips []net.IP
-		if hostDNSCache != nil {
-			if cached, ok := hostDNSCache.GetIPs(dh); ok {
-				l.Debug("DNS cache hit (host)", "remote", remote, "host", dh, "ips", fmt.Sprint(cached))
-				ips = cached
-			}
-		}
-		if ips == nil {
-			l.Debug("resolving destination host", "remote", remote, "host", dh)
-			lookupStart := time.Now()
-			ips, err = net.LookupIP(dh)
-			if err != nil {
-				l.Warn("failed to resolve destination", "remote", remote, "host", dh, "error", err.Error(), "duration", time.Since(start).String())
-				lConn.Close()
-				return
-			}
-			l.Debug("destination resolved", "remote", remote, "host", dh, "ip", ips[0].String(), "duration", time.Since(lookupStart).String())
+		if isWg {
+			// No host DNS leak: treat hostname as allowed and skip block check.
+			// The actual resolution will happen inside the WG tunnel (see wg.go
+			// resolveAddrPort which uses tnet.LookupContextHost).
+			l.Debug("skipping host DNS for block check (WG enabled, no leak)", "remote", remote, "host", dh)
+			addr = netip.Addr{} // invalid, but blockFlag will stay false
+			blockFlag = false
+		} else {
+			// Direct mode: must resolve via host DNS for block check (with cache).
+			var ips []net.IP
 			if hostDNSCache != nil {
-				hostDNSCache.SetIPs(dh, ips)
+				if cached, ok := hostDNSCache.GetIPs(dh); ok {
+					l.Debug("DNS cache hit (host)", "remote", remote, "host", dh, "ips", fmt.Sprint(cached))
+					ips = cached
+				}
 			}
+			if ips == nil {
+				l.Debug("resolving destination host", "remote", remote, "host", dh)
+				lookupStart := time.Now()
+				ips, err = net.LookupIP(dh)
+				if err != nil {
+					l.Warn("failed to resolve destination", "remote", remote, "host", dh, "error", err.Error(), "duration", time.Since(start).String())
+					lConn.Close()
+					return
+				}
+				l.Debug("destination resolved", "remote", remote, "host", dh, "ip", ips[0].String(), "duration", time.Since(lookupStart).String())
+				if hostDNSCache != nil {
+					hostDNSCache.SetIPs(dh, ips)
+				}
+			}
+
+			// parse the first IP and use it
+			addr, _ = netip.AddrFromSlice(ips[0])
+			blockFlag = !addr.IsValid() || !connFilter.isDestinationAllowed(addr)
 		}
-
-		// parse the first IP and use it
-		addr, _ = netip.AddrFromSlice(ips[0])
+	} else {
+		// If the address is invalid or not allowed as a destination, set the block flag.
+		blockFlag = !addr.IsValid() || !connFilter.isDestinationAllowed(addr)
 	}
-
-	// If the address is invalid or not allowed as a destination, set the block flag.
-	blockFlag = !addr.IsValid() || !connFilter.isDestinationAllowed(addr)
 
 	if blockFlag {
 		l.Warn("destination host is blocked", "remote", remote, "address", address)
 		lConn.Close()
 		return
+	}
+
+	// Peek at first payload bytes for TLS SNI debugging (ChatGPT etc).
+	// This helps diagnose "unexpected SSL certificate" where SNI was corrupted
+	// by the header framing fix.
+	if peek, err := reader.Peek(16); err == nil && len(peek) > 0 {
+		// 0x16 0x03 = TLS handshake, peek SNI if present
+		l.Debug("first payload peek", "remote", remote, "address", address, "bytes", fmt.Sprintf("%x", peek), "ascii", fmt.Sprintf("%q", string(peek)))
 	}
 
 	// Preserve any bytes already buffered by the bufio.Reader. Using the
@@ -287,11 +331,11 @@ func main() {
 		l.Info("DNS cache disabled")
 	}
 
-	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if err := run(ctx, l, *bind, *wgConfPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-
-	<-ctx.Done()
+	l.Info("relay exited cleanly")
 }
