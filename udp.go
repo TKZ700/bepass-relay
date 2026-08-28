@@ -7,12 +7,14 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 )
 
 var (
-	activeTunnels    = make(map[string]chan []byte)
-	udpToTCPChannels = make(map[string]chan []byte)
+	udpMu             sync.Mutex
+	activeTunnels     = make(map[string]chan []byte)
+	udpToTCPChannels  = make(map[string]chan []byte)
 )
 
 // readFromConn reads data from a net.Conn and sends it to a channel.
@@ -44,11 +46,18 @@ func readFromConn(l *slog.Logger, conn net.Conn, c chan<- []byte) {
 // handleUDPOverTCP handles UDP-over-TCP traffic.
 func handleUDPOverTCP(l *slog.Logger, ob outbound, conn net.Conn, destination string) {
 	// On return, delete the destination from the map of active tunnels
-	defer delete(activeTunnels, destination)
+	defer func() {
+		udpMu.Lock()
+		delete(activeTunnels, destination)
+		udpMu.Unlock()
+	}()
 
 	// Store a byte channel in the map of active tunnels. The data read
 	// from the UDP socket is sent on this channel.
+	udpMu.Lock()
 	activeTunnels[destination] = make(chan []byte)
+	tunnelCh := activeTunnels[destination]
+	udpMu.Unlock()
 
 	wsReadDataChan := make(chan []byte)
 	go readFromConn(l, conn, wsReadDataChan)
@@ -68,7 +77,7 @@ func handleUDPOverTCP(l *slog.Logger, ob outbound, conn net.Conn, destination st
 
 			udpWriteChan <- dataFromWS
 
-		case dataFromUDP := <-activeTunnels[destination]:
+		case dataFromUDP := <-tunnelCh:
 			if dataFromUDP == nil {
 				continue
 			}
@@ -88,28 +97,39 @@ func handleUDPOverTCP(l *slog.Logger, ob outbound, conn net.Conn, destination st
 // getOrCreateUDPChan returns an existing UDP channel or creates a new one.
 func getOrCreateUDPChan(l *slog.Logger, ob outbound, destination, header string) (chan []byte, error) {
 	channelID := destination + header
+
+	udpMu.Lock()
 	if udpWriteChan, ok := udpToTCPChannels[channelID]; ok {
+		udpMu.Unlock()
 		return udpWriteChan, nil
 	}
 
+	udpToTCPChannels[channelID] = make(chan []byte)
+	ch := udpToTCPChannels[channelID]
+	udpMu.Unlock()
+
 	udpConn, err := ob.DialContext(context.Background(), "udp", destination)
 	if err != nil {
+		udpMu.Lock()
+		delete(udpToTCPChannels, channelID)
+		udpMu.Unlock()
 		return nil, err
 	}
 
-	udpToTCPChannels[channelID] = make(chan []byte)
 	udpReadChanFromConn := make(chan []byte)
 	go readFromConn(l, udpConn, udpReadChanFromConn)
 
 	go func() {
 		defer func() {
+			udpMu.Lock()
 			delete(udpToTCPChannels, channelID)
+			udpMu.Unlock()
 			udpConn.Close()
 		}()
 
 		for {
 			select {
-			case dataFromWS := <-udpToTCPChannels[channelID]:
+			case dataFromWS := <-ch:
 				if len(dataFromWS) < 8 {
 					return
 				}
@@ -128,12 +148,16 @@ func getOrCreateUDPChan(l *slog.Logger, ob outbound, destination, header string)
 					return
 				}
 
-				if c, ok := activeTunnels[destination]; ok {
-					c <- append([]byte(header[6:]), dataFromUDP...)
+				udpMu.Lock()
+				tunnelCh, ok := activeTunnels[destination]
+				udpMu.Unlock()
+
+				if ok && tunnelCh != nil {
+					tunnelCh <- append([]byte(header[6:]), dataFromUDP...)
 				}
 			}
 		}
 	}()
 
-	return udpToTCPChannels[channelID], nil
+	return ch, nil
 }

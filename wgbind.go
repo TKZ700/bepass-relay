@@ -5,7 +5,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -24,17 +23,9 @@ func (e *wgClientEndpoint) SrcIP() netip.Addr   { return netip.Addr{} }
 func (e *wgClientEndpoint) DstIP() netip.Addr   { return e.ap.Addr() }
 func (e *wgClientEndpoint) DstToString() string { return e.ap.String() }
 
-// DstToBytes is used for mac2 cookie calculations; any stable encoding of the
-// destination address works.
 func (e *wgClientEndpoint) DstToBytes() []byte {
-	addr := e.ap.Addr().Unmap()
-	var b [16]byte
-	copy(b[:], addr.AsSlice())
-	out := binary.BigEndian.AppendUint16(b[:], e.ap.Port())
-	if !addr.Is4() {
-		out = binary.BigEndian.AppendUint16(out, 0xffff)
-	}
-	return out
+	b, _ := e.ap.MarshalBinary()
+	return b
 }
 
 type wgClientBind struct {

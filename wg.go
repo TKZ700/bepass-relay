@@ -27,9 +27,13 @@ type wireGuardOutbound struct {
 	dev        *device.Device
 	tnet       *netstack.Net
 	localAddrs []netip.Addr
-	upOnce     sync.Once
+	mu         sync.Mutex
+	devUp      bool
 	upErr      error
+	upFailedAt time.Time
 }
+
+const wgUpRetryCooldown = 30 * time.Second
 
 func newWireGuardOutbound(l *slog.Logger, cfg *wgConfig) (*wireGuardOutbound, error) {
 	endpoint, err := resolveUDPEndpoint(cfg.Peer.Endpoint)
@@ -119,15 +123,29 @@ func (o *wireGuardOutbound) Close() error {
 	return nil
 }
 
-// ensureUp brings the device up on first use. A failed attempt is cached;
-// subsequent dials fall straight through to the failover path.
+// ensureUp brings the device up on first use. A failed attempt is cached for
+// wgUpRetryCooldown before being retried, so transient failures don't
+// permanently disable the tunnel.
 func (o *wireGuardOutbound) ensureUp() error {
-	o.upOnce.Do(func() {
-		if err := o.dev.Up(); err != nil {
-			o.upErr = fmt.Errorf("bring up wireguard device: %w", err)
-		}
-	})
-	return o.upErr
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.devUp {
+		return nil
+	}
+	if o.upErr != nil && time.Since(o.upFailedAt) < wgUpRetryCooldown {
+		return o.upErr
+	}
+
+	if err := o.dev.Up(); err != nil {
+		o.upErr = fmt.Errorf("bring up wireguard device: %w", err)
+		o.upFailedAt = time.Now()
+		return o.upErr
+	}
+
+	o.devUp = true
+	o.upErr = nil
+	return nil
 }
 
 func (o *wireGuardOutbound) resolveAddrPort(ctx context.Context, address string) (netip.AddrPort, error) {

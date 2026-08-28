@@ -21,6 +21,18 @@ import (
 
 const BUFFER_SIZE = 2048
 
+// multiConn wraps an io.Reader and a net.Conn so that reads go through the
+// reader (which may contain buffered data from a prior bufio.Reader) while
+// writes, deadlines, and Close delegate to the raw connection.
+type multiConn struct {
+	io.Reader
+	net.Conn
+}
+
+func (c *multiConn) Read(p []byte) (int, error) {
+	return c.Reader.Read(p)
+}
+
 // buildOutbound constructs the outbound chain. Without a WireGuard config the
 // relay dials directly; with one, every connection is attempted through the
 // tunnel and falls back to direct dialing on failure.
@@ -132,6 +144,11 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 		return
 	}
 
+	// Combine any data already buffered by the bufio.Reader with the raw
+	// connection so that no client bytes are lost after the header.
+	combinedReader := io.MultiReader(reader, lConn)
+	mc := &multiConn{Reader: combinedReader, Conn: lConn}
+
 	switch network {
 	case "tcp":
 		rConn, err := ob.DialContext(context.Background(), network, address)
@@ -141,10 +158,10 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 			return
 		}
 
-		go handleTCP(lConn, rConn)
+		go handleTCP(mc, rConn)
 
 	case "udp":
-		go handleUDPOverTCP(l, ob, lConn, address)
+		go handleUDPOverTCP(l, ob, mc, address)
 	}
 	l.Debug("relaying connection", "protocol", network, "address", address)
 }
