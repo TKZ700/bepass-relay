@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"time"
 )
 
 // outbound dials connections to a destination address ("host:port").
@@ -20,7 +21,9 @@ type directOutbound struct {
 }
 
 func newDirectOutbound() *directOutbound {
-	return &directOutbound{}
+	return &directOutbound{
+		dialer: net.Dialer{Timeout: 15 * time.Second},
+	}
 }
 
 func (o *directOutbound) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -44,16 +47,52 @@ func newFailoverOutbound(l *slog.Logger, primary, fallback outbound) *failoverOu
 }
 
 func (o *failoverOutbound) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	start := time.Now()
 	conn, err := o.primary.DialContext(ctx, network, address)
 	if err == nil {
+		o.l.Info("outbound via wireguard",
+			"protocol", network,
+			"address", address,
+			"duration", time.Since(start).String(),
+		)
 		return conn, nil
 	}
-	o.l.Debug("wireguard outbound failed, falling back to direct dial",
+
+	o.l.Warn("wireguard dial failed, falling back to direct",
 		"protocol", network,
 		"address", address,
 		"error", err.Error(),
+		"duration", time.Since(start).String(),
 	)
-	return o.fallback.DialContext(ctx, network, address)
+
+	// If the original context was cancelled/timed-out during the WG
+	// attempt, the fallback must use a fresh context or it will fail
+	// instantly with the same deadline.
+	fallbackCtx := ctx
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		fallbackCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		o.l.Debug("using fresh context for fallback dial", "reason", ctx.Err().Error())
+	}
+
+	start2 := time.Now()
+	fbConn, fbErr := o.fallback.DialContext(fallbackCtx, network, address)
+	if fbErr != nil {
+		o.l.Error("fallback direct dial also failed",
+			"protocol", network,
+			"address", address,
+			"error", fbErr.Error(),
+			"duration", time.Since(start2).String(),
+		)
+		return nil, fbErr
+	}
+	o.l.Info("outbound via direct (fallback)",
+		"protocol", network,
+		"address", address,
+		"duration", time.Since(start2).String(),
+	)
+	return fbConn, nil
 }
 
 func (o *failoverOutbound) Close() error {

@@ -83,7 +83,9 @@ func newWireGuardOutbound(l *slog.Logger, cfg *wgConfig) (*wireGuardOutbound, er
 		"local_addresses", fmt.Sprint(localAddrs),
 		"dns", fmt.Sprint(dnsServers),
 		"mtu", cfg.MTU,
+		"listen_port", cfg.ListenPort,
 	)
+	l.Info("wireguard will be brought up on first dial; run with -v to see handshake logs (look for 'Handshake did not complete' or 'Received handshake response')")
 	return o, nil
 }
 
@@ -96,25 +98,60 @@ func (o *wireGuardOutbound) DialContext(ctx context.Context, network, address st
 		return nil, fmt.Errorf("unsupported network %q for wireguard outbound", network)
 	}
 
+	o.l.Debug("wireguard dial start", "protocol", network, "address", address)
+
 	if err := o.ensureUp(); err != nil {
+		o.l.Error("wireguard device not up", "protocol", network, "address", address, "error", err.Error())
 		return nil, err
 	}
 
 	raddr, err := o.resolveAddrPort(ctx, address)
 	if err != nil {
+		o.l.Warn("wireguard resolve failed", "protocol", network, "address", address, "error", err.Error())
 		return nil, err
 	}
+	o.l.Debug("wireguard resolved", "protocol", network, "address", address, "resolved", raddr.String())
 
 	if network == "tcp" {
+		start := time.Now()
 		dialCtx, cancel := context.WithTimeout(ctx, wgDialTimeout)
 		defer cancel()
 		conn, err := o.tnet.DialContextTCPAddrPort(dialCtx, raddr)
 		if err != nil {
+			o.l.Warn("wireguard tunnel dial failed", "protocol", network, "address", address, "resolved", raddr.String(), "error", err.Error(), "duration", time.Since(start).String())
+			// Hint about common causes.
+			if isTimeout(err) {
+				o.l.Warn("wireguard tunnel dial timed out – handshake likely did not complete; check server AllowedIPs, firewall/UDP blocking, and run with -v for handshake logs")
+			}
 			return nil, fmt.Errorf("tunnel dial %s: %w", raddr, err)
 		}
+		o.l.Debug("wireguard tunnel dial succeeded", "protocol", network, "address", address, "resolved", raddr.String(), "duration", time.Since(start).String())
 		return conn, nil
 	}
-	return o.tnet.DialUDPAddrPort(netip.AddrPort{}, raddr)
+
+	start := time.Now()
+	conn, err := o.tnet.DialUDPAddrPort(netip.AddrPort{}, raddr)
+	if err != nil {
+		o.l.Warn("wireguard tunnel dial failed", "protocol", network, "address", address, "resolved", raddr.String(), "error", err.Error(), "duration", time.Since(start).String())
+		return nil, err
+	}
+	o.l.Debug("wireguard tunnel dial succeeded", "protocol", network, "address", address, "resolved", raddr.String(), "duration", time.Since(start).String())
+	return conn, nil
+}
+
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err.Error() == "context deadline exceeded" {
+		return true
+	}
+	//net.Error with Timeout() true
+	type timeoutErr interface{ Timeout() bool }
+	if te, ok := err.(timeoutErr); ok && te.Timeout() {
+		return true
+	}
+	return false
 }
 
 // Close shuts down the tunnel device. Safe to call multiple times.
@@ -137,14 +174,18 @@ func (o *wireGuardOutbound) ensureUp() error {
 		return o.upErr
 	}
 
+	o.l.Info("bringing wireguard device up")
+	start := time.Now()
 	if err := o.dev.Up(); err != nil {
 		o.upErr = fmt.Errorf("bring up wireguard device: %w", err)
 		o.upFailedAt = time.Now()
+		o.l.Error("wireguard device up failed", "error", o.upErr.Error(), "duration", time.Since(start).String())
 		return o.upErr
 	}
 
 	o.devUp = true
 	o.upErr = nil
+	o.l.Info("wireguard device is up", "duration", time.Since(start).String())
 	return nil
 }
 
@@ -165,12 +206,16 @@ func (o *wireGuardOutbound) resolveAddrPort(ctx context.Context, address string)
 	}
 
 	// Not an IP literal; resolve through the tunnel's DNS servers.
+	o.l.Debug("wireguard DNS lookup via tunnel", "host", host)
 	dnsCtx, cancel := context.WithTimeout(ctx, wgDNSTimeout)
 	defer cancel()
+	start := time.Now()
 	addrs, err := o.tnet.LookupContextHost(dnsCtx, host)
 	if err != nil {
+		o.l.Warn("wireguard DNS lookup failed", "host", host, "error", err.Error(), "duration", time.Since(start).String())
 		return netip.AddrPort{}, fmt.Errorf("resolve %q through tunnel: %w", host, err)
 	}
+	o.l.Debug("wireguard DNS lookup succeeded", "host", host, "addrs", fmt.Sprint(addrs), "duration", time.Since(start).String())
 
 	chosen, ok := pickFamilyMatch(o.localAddrs, addrs)
 	if !ok {

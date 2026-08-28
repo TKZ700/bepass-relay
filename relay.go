@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
@@ -62,11 +63,18 @@ func run(ctx context.Context, l *slog.Logger, bind, wgConfigPath string) error {
 	}
 	defer ob.Close()
 
+	if wgConfigPath != "" {
+		l.Info("wireguard chaining enabled", "config", wgConfigPath)
+	} else {
+		l.Info("wireguard chaining disabled (direct outbound)")
+	}
+
 	listener, err := net.Listen("tcp", bind)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
+	l.Info("relay listening", "bind", bind)
 
 	for {
 		select {
@@ -94,16 +102,32 @@ func run(ctx context.Context, l *slog.Logger, bind, wgConfigPath string) error {
 }
 
 func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
+	start := time.Now()
+	remote := lConn.RemoteAddr().String()
+	l.Info("new connection", "remote", remote)
+
 	reader := bufio.NewReader(lConn)
 
-	header, _ := reader.ReadBytes(byte(13))
-	if len(header) < 1 {
+	// Guard header read with a deadline so a stuck client can't hold the
+	// goroutine forever.
+	_ = lConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	header, err := reader.ReadBytes(byte(13))
+	_ = lConn.SetReadDeadline(time.Time{})
+	if err != nil {
+		l.Warn("failed to read header", "remote", remote, "error", err.Error(), "duration", time.Since(start).String())
 		lConn.Close()
 		return
 	}
+	if len(header) < 1 {
+		l.Warn("empty header", "remote", remote, "duration", time.Since(start).String())
+		lConn.Close()
+		return
+	}
+	l.Debug("header received", "remote", remote, "raw", fmt.Sprintf("%q", string(header)), "duration", time.Since(start).String())
 
 	inputHeader := strings.Split(string(header[:len(header)-1]), "@")
 	if len(inputHeader) < 2 {
+		l.Warn("invalid header format", "remote", remote, "header", fmt.Sprintf("%q", string(header)))
 		lConn.Close()
 		return
 	}
@@ -116,6 +140,7 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 	address := strings.Replace(inputHeader[1], "$", ":", -1)
 	dh, _, err := net.SplitHostPort(address)
 	if err != nil {
+		l.Warn("invalid address in header", "remote", remote, "address", address, "error", err.Error())
 		lConn.Close()
 		return
 	}
@@ -125,11 +150,14 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 	addr, err := netip.ParseAddr(dh)
 	if err != nil {
 		// the host may not be an IP, try to resolve it
+		l.Debug("resolving destination host", "remote", remote, "host", dh)
 		ips, err := net.LookupIP(dh)
 		if err != nil {
+			l.Warn("failed to resolve destination", "remote", remote, "host", dh, "error", err.Error(), "duration", time.Since(start).String())
 			lConn.Close()
 			return
 		}
+		l.Debug("destination resolved", "remote", remote, "host", dh, "ip", ips[0].String())
 
 		// parse the first IP and use it
 		addr, _ = netip.AddrFromSlice(ips[0])
@@ -139,7 +167,7 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 	blockFlag = !addr.IsValid() || !connFilter.isDestinationAllowed(addr)
 
 	if blockFlag {
-		l.Debug("destination host is blocked", "address", address)
+		l.Warn("destination host is blocked", "remote", remote, "address", address)
 		lConn.Close()
 		return
 	}
@@ -149,21 +177,26 @@ func handleConnection(l *slog.Logger, ob outbound, lConn net.Conn) {
 	// is lost, even when the header and payload arrived in one segment.
 	mc := &multiConn{Reader: reader, Conn: lConn}
 
+	l.Info("dialing destination", "remote", remote, "protocol", network, "address", address)
+	dialStart := time.Now()
+
 	switch network {
 	case "tcp":
 		rConn, err := ob.DialContext(context.Background(), network, address)
 		if err != nil {
-			l.Error("failed to dial", "protocol", network, "address", address, "error", err.Error())
+			l.Error("failed to dial", "remote", remote, "protocol", network, "address", address, "error", err.Error(), "duration", time.Since(dialStart).String(), "total", time.Since(start).String())
 			lConn.Close()
 			return
 		}
+		l.Info("dial succeeded, starting relay", "remote", remote, "protocol", network, "address", address, "duration", time.Since(dialStart).String(), "total", time.Since(start).String())
 
-		go handleTCP(mc, rConn)
+		go handleTCPWithLogger(l, mc, rConn, remote, address)
 
 	case "udp":
+		l.Info("starting UDP over TCP relay", "remote", remote, "address", address, "duration", time.Since(dialStart).String())
 		go handleUDPOverTCP(l, ob, mc, address)
 	}
-	l.Debug("relaying connection", "protocol", network, "address", address)
+	l.Debug("relaying connection", "remote", remote, "protocol", network, "address", address, "duration", time.Since(start).String())
 }
 
 
